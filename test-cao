@@ -1,0 +1,144 @@
+#これは改善前のcaoです
+
+import random
+
+# --- グローバルパラメータ ---
+# 個々の暗号化（AさんやBさんが行う）の最大平文長（バイト数）
+MAX_PLAINTEXT_LEN = 16
+# 暗号文の「本文部」を固定長で表現するバイト数（平文長が最大16の場合、内部計算では最大必要バイト数は 16+1 程度）
+CT_BODY_LEN = 17  # 固定長（バイト数）
+# 暗号文全体は、ヘッダー部1バイト（16進数2桁）＋本文部（CT_BODY_LENバイト→2*CT_BODY_LEN桁）の16進数文字列
+# 今回は「秘密鍵 K」は 0～255 の整数とする（セキュリティは考慮していません）
+K = random.randint(0, 255)
+print(f"[DEBUG] 選ばれた秘密鍵 K = {K}")
+
+
+# --- 補助関数 ---
+def F(L: int) -> int:
+    """F(L) = (256^L - 1) // 255  (L>=0)"""
+    if L == 0:
+        return 0
+    return (256**L - 1) // 255
+
+
+def int_to_fixed_bytes(n: int, length: int) -> bytes:
+    """整数 n を、指定バイト数 length の big-endian バイト列（ゼロ埋め）に変換"""
+    return n.to_bytes(length, byteorder="big")
+
+
+def bytes_to_int(b: bytes) -> int:
+    """バイト列を整数に変換（big-endian）"""
+    return int.from_bytes(b, byteorder="big")
+
+
+# --- 暗号化・復号関数 ---
+def encrypt_string(plaintext: str) -> str:
+    """
+    平文を暗号化する。
+    ・平文は最大 MAX_PLAINTEXT_LEN バイトまで（それ以下の場合はその実際の長さ L を用いる）
+    ・内部で、平文を整数 m に変換し、暗号文の整数値は
+         C = m + K * F(L)
+      とする。（ここで F(L) = (256^L - 1)//255）
+    ・出力は、1バイト（平文の長さ L を16進数2桁）＋本文部（CT_BODY_LEN バイト分を16進数2桁）となる固定長文字列。
+    """
+    # エンコード（utf-8）してバイト列に変換
+    pt_bytes = plaintext.encode("utf-8")
+    L = len(pt_bytes)
+    if L > MAX_PLAINTEXT_LEN:
+        raise ValueError(
+            f"平文は最大 {MAX_PLAINTEXT_LEN} バイトまでです。（入力長 {L} バイト）"
+        )
+    m = int.from_bytes(pt_bytes, "big")
+    # 暗号文の内部数値
+    C = m + K * F(L)
+    # C を CT_BODY_LEN バイトの固定長バイト列に変換（ゼロ埋め）
+    C_bytes = int_to_fixed_bytes(C, CT_BODY_LEN)
+    # ヘッダー部：平文のバイト長 L を1バイト（16進数2桁）で表現
+    header = L.to_bytes(1, "big").hex()
+    body = C_bytes.hex()
+    ct_str = header + body
+    return ct_str
+
+
+def decrypt_string(ct_str: str) -> str:
+    """
+    暗号文（固定長の16進数文字列）を復号する。
+    ・先頭1バイト（2文字）から平文の実際のバイト長 L を得る
+    ・残りの部分を本文部として整数 C として解釈し、
+         m = C - K * F(L)
+      として平文整数 m を得る。
+    ・m を L バイトのバイト列に変換し、UTF-8 で復号する。
+    """
+    if len(ct_str) != (1 * 2 + CT_BODY_LEN * 2):
+        raise ValueError("暗号文の長さが不正です。")
+    header = ct_str[:2]
+    body_hex = ct_str[2:]
+    L = int(header, 16)
+    C = int(body_hex, 16)
+    m = C - K * F(L)
+    # m を L バイトのバイト列に変換（m のバイト数が L 未満の場合はゼロ埋め）
+    m_bytes = int_to_fixed_bytes(m, L)
+    try:
+        plaintext = m_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        plaintext = "<復号エラー>"
+    return plaintext
+
+
+# --- 同型的連結（足し合わせ） ---
+def homomorphic_concat(ct_str1: str, ct_str2: str) -> str:
+    """
+    2 つの暗号文（固定長の文字列）について、以下の演算を行う：
+      1. それぞれの暗号文から、ヘッダー部（L1, L2）と本文部（整数 C1, C2）を得る。
+      2. 演算： C_concat = C1 * 256^(L2) + C2, かつ L_concat = L1 + L2 とする。
+         （※前述の F(L) の性質から、これにより
+             C_concat = m1 * 256^(L2) + m2 + K * F(L1+L2)
+         となり、これは「平文連結の暗号化」に対応する。）
+      3. 得られた C_concat を固定長（本文部は CT_BODY_LEN バイト）にゼロ埋めし、ヘッダー部として L_concat（1バイト）を付加する。
+    ※ Cさんはこの演算のみ行い、内部の秘密鍵 K は知らないため、平文は分からない。
+    """
+    # 各暗号文からヘッダー（平文長）と本文部を取得
+    if len(ct_str1) != (2 + CT_BODY_LEN * 2) or len(ct_str2) != (2 + CT_BODY_LEN * 2):
+        raise ValueError("入力暗号文の長さが不正です。")
+    L1 = int(ct_str1[:2], 16)
+    L2 = int(ct_str2[:2], 16)
+    C1 = int(ct_str1[2:], 16)
+    C2 = int(ct_str2[2:], 16)
+    # homomorphic concatenation:
+    # (C1, L1) ⊕ (C2, L2) = ( C1 * 256^(L2) + C2, L1+L2 )
+    C_concat = C1 * (256**L2) + C2
+    L_concat = L1 + L2
+    # ※注意：本来、L_concat の最大値は個々の平文最大長を超えないように運用すべきですが、
+    # ここではシンプルな例として、実際の連結長をそのまま用います。
+    # 結果の本文部は、固定長 CT_BODY_LEN バイト（16進数2桁×CT_BODY_LEN）にゼロ埋めして表現
+    C_concat_bytes = int_to_fixed_bytes(C_concat, CT_BODY_LEN)
+    header_concat = L_concat.to_bytes(1, "big").hex()
+    return header_concat + C_concat_bytes.hex()
+
+
+# --- デモ ---
+if __name__ == "__main__":
+    # Aさんが "HELLO" を暗号化
+    plaintext_A = "HELLO"
+    ct_A = encrypt_string(plaintext_A)
+    print("[Aさんの暗号化結果]")
+    print("平文:", plaintext_A)
+    print("暗号文:", ct_A)
+
+    # Bさんが "HEY" を暗号化
+    plaintext_B = "HEY"
+    ct_B = encrypt_string(plaintext_B)
+    print("\n[Bさんの暗号化結果]")
+    print("平文:", plaintext_B)
+    print("暗号文:", ct_B)
+
+    # Cさん：受信した暗号文同士を同型的に連結（足し合わせ）
+    ct_concat = homomorphic_concat(ct_A, ct_B)
+    print("\n[Cさんによる暗号文連結結果]")
+    print("連結後の暗号文:", ct_concat)
+    # Cさんは平文はわからない（秘密鍵 K は知らないため）
+
+    # Aさんが連結された暗号文を復号
+    plaintext_concat = decrypt_string(ct_concat)
+    print("\n[Aさんによる復号結果]")
+    print("復号平文:", plaintext_concat)  # 期待: "HELLOHEY"
