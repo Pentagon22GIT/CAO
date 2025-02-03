@@ -1,160 +1,201 @@
 import random
-import math
-
-# ===== グローバルパラメータ =====
-
-# 暗号化する平文の最大バイト数（例：16バイト以内）
-MAX_PLAINTEXT_LEN = 16
-
-# メルセンヌ素数 p = 2^521 - 1（521ビットの素数：十分大きい）
-p = 2**521 - 1
-
-# CT_BODY_LEN: p を表現するのに必要な固定バイト数（521ビット ≒ 66バイト）
-CT_BODY_LEN = 66
-
-# 秘密鍵 K（例として 0～255 の整数）
-K = random.randint(0, 255)
-
-# 秘密の乗数 A （pは素数なので、1～p-1 の任意の値は逆元を持つ）
-A = random.randint(1, p - 1)
-# A の逆元（p は素数なので pow(A, -1, p) で求められる）
-A_inv = pow(A, -1, p)
-
-# デバッグ用（実際の運用では秘密情報は隠すべきです）
-print(f"[DEBUG] p = {p}")
-print(f"[DEBUG] 秘密鍵 K = {K}")
-print(f"[DEBUG] 乗数 A = {A}")
-print(f"[DEBUG] Aの逆元 A_inv = {A_inv}")
 
 
-# ===== 補助関数 =====
-def F(L: int) -> int:
-    """F(L) = (256^L - 1) // 255　（L >= 0）"""
-    if L == 0:
-        return 0
-    return (256**L - 1) // 255
-
-
-def int_to_fixed_bytes(n: int, length: int) -> bytes:
-    """整数 n を、指定バイト数 length の big-endian バイト列（ゼロ埋め）に変換"""
-    return n.to_bytes(length, byteorder="big")
-
-
-def bytes_to_int(b: bytes) -> int:
-    """バイト列を整数に変換（big-endian）"""
-    return int.from_bytes(b, byteorder="big")
-
-
-# ===== 改良版 暗号化／復号関数 =====
-def encrypt_string_improved(plaintext: str) -> str:
-    """
-    平文を暗号化する。
-    ・平文は UTF-8 でバイト列に変換し、その長さ L を取得（MAX_PLAINTEXT_LEN バイト以内）
-    ・平文整数 m を得る。
-    ・内部計算： X = m + K * F(L)
-    ・さらに、C_internal = A * X mod p とし、これを固定長（CT_BODY_LEN バイト）の16進数文字列にする。
-    ・ヘッダー部として平文長 L を1バイト（16進数2桁）で付与。
-    ・最終的な暗号文は「ヘッダー＋本文部」で一定長の文字列となる。
-    """
-    pt_bytes = plaintext.encode("utf-8")
-    L = len(pt_bytes)
-    if L > MAX_PLAINTEXT_LEN:
-        raise ValueError(
-            f"平文は最大 {MAX_PLAINTEXT_LEN} バイトまでです。（入力長 {L} バイト）"
-        )
-    m = int.from_bytes(pt_bytes, "big")
-    # 内部計算（整数演算）：X = m + K * F(L)
-    X = m + K * F(L)
-    # ブラインディング：C_internal = A * X mod p
-    C_internal = (A * X) % p
-    # 固定長表現：C_internal を CT_BODY_LEN バイトに変換
-    body = int_to_fixed_bytes(C_internal, CT_BODY_LEN).hex()
-    # ヘッダー部：平文長 L を1バイト（16進数2桁）で表現
-    header = L.to_bytes(1, "big").hex()
-    ct_str = header + body
-    return ct_str
-
-
-def decrypt_string_improved(ct_str: str) -> str:
-    """
-    暗号文（16進数文字列）を復号する。
-    ・先頭1バイト（2文字）から平文のバイト長 L を得る。
-    ・本文部全体から整数 C_internal を取得し、X = C_internal * A_inv mod p とする。
-    ・平文整数 m = X - K * F(L) を得、これを L バイトのバイト列に変換して UTF-8 で復号する。
-    """
-    # 固定長チェックは削除または緩和
-    if len(ct_str) < 2:
-        raise ValueError("暗号文が短すぎます。")
-    header = ct_str[:2]
-    body_hex = ct_str[2:]
-    L = int(header, 16)
-    # 本文部のバイト数は、16進数文字列なので半分
-    body_byte_len = len(body_hex) // 2
-    C_internal = int(body_hex, 16)
-    # 復号：X = (C_internal * A_inv) mod p
-    X = (C_internal * A_inv) % p
-    m = X - K * F(L)
-    # 平文 m を L バイトに変換（ゼロ埋め）
-    m_bytes = int_to_fixed_bytes(m, L)
-    try:
-        plaintext = m_bytes.decode("utf-8")
-    except UnicodeDecodeError:
-        plaintext = "<復号エラー>"
-    return plaintext
-
-
-def homomorphic_concat_improved(ct_str1: str, ct_str2: str) -> str:
-    """
-    2 つの暗号文（固定長文字列）に対し、以下の同型的連結を行う。
-    1. 各暗号文から、ヘッダー部（平文バイト長 L1, L2）と本文部（整数 C1, C2）を抽出。
-    2. 演算： C_concat = C1 * 256^(L2) + C2, L_concat = L1 + L2 とする。
-       ※実際、C1 = A*(m1+K*F(L1))、C2 = A*(m2+K*F(L2)) なので、
-         C_concat = A*(m1*256^(L2)+m2+K*(F(L1)*256^(L2)+F(L2)))
-         となり、F(L1)*256^(L2)+F(L2) = F(L1+L2) であるため、連結された暗号文は
-         A*(m_concat+K*F(L_concat)) となる。
-    3. 結果をヘッダー部（L_concat を1バイト）＋本文部（固定長 CT_BODY_LEN バイト）の16進数文字列として出力する。
-    ※ p が十分大きければラップアラウンドは発生しません。
-    """
-    if len(ct_str1) != (1 * 2 + CT_BODY_LEN * 2) or len(ct_str2) != (
-        1 * 2 + CT_BODY_LEN * 2
+class ToyHomomorphicEncryptionEnhanced:
+    def __init__(
+        self, scale=100000, noise_bound=10, byte_length=32, A_bits=120, B_bits=120
     ):
-        raise ValueError("入力暗号文の長さが不正です。")
-    L1 = int(ct_str1[:2], 16)
-    L2 = int(ct_str2[:2], 16)
-    C1 = int(ct_str1[2:], 16)
-    C2 = int(ct_str2[2:], 16)
-    # 同型的連結演算
-    C_concat = C1 * (256**L2) + C2
-    L_concat = L1 + L2
-    # 結果の本文部を固定長 CT_BODY_LEN バイトに変換
-    body_concat = int_to_fixed_bytes(C_concat, CT_BODY_LEN + L2).hex()
-    header_concat = L_concat.to_bytes(1, "big").hex()
-    return header_concat + body_concat
+        """
+        scale: 平文を拡大する定数（大きいほど丸め誤差が小さくなる）。
+        noise_bound: 暗号化時に付加する雑音の上限（-noise_bound～noise_bound）。
+        byte_length: 暗号文を固定長バイト列にするためのバイト数（例：32バイト＝256ビット）。
+        A_bits: 秘密乗数 A のビット長（難読化のための第一段階）。
+        B_bits: 追加の秘密乗数 B のビット長（暗号文が固定長全体に分布するようにする）。
+
+        なお、ここでは最終的な暗号文を整数環 \( \mathbb{Z}_M \) （M = 2^(8*byte_length)）内の値として扱い、
+        固定長の16進数文字列に変換します。
+        """
+        self.scale = scale
+        self.noise_bound = noise_bound
+        self.byte_length = byte_length
+        # モジュラス M（例：256ビット）
+        self.M = 2 ** (8 * self.byte_length)
+        # 秘密乗数 A：平文の拡大値に対して乗じる（奇数にしておく）
+        self.A = random.getrandbits(A_bits) | 1
+        # 追加の秘密乗数 B：これにより暗号文が全ビット域に広がるようにする（奇数にして逆元が存在）
+        self.B = random.getrandbits(B_bits) | 1
+        # M内での B の逆元（B_inv * B ≡ 1 mod M）
+        self.B_inv = pow(self.B, -1, self.M)
+
+    def _encode(self, value):
+        """
+        整数 value を符号なしとして固定長（byte_length バイト）のバイト列に変換し、
+        16進数文字列にエンコードします。
+        """
+        # value は 0 ≤ value < M を前提
+        return value.to_bytes(self.byte_length, byteorder="big", signed=False).hex()
+
+    def _decode(self, cipher_str):
+        """
+        固定長16進数文字列 cipher_str をバイト列に戻し、整数に変換します。
+        """
+        return int.from_bytes(bytes.fromhex(cipher_str), byteorder="big", signed=False)
+
+    def encrypt(self, m):
+        """
+        暗号化処理：
+          1. 平文 m（浮動小数点数）を scale 倍して整数化し、雑音を加えた値 base_val を得る。
+          2. base_val に秘密乗数 A を掛け、さらに追加乗数 B を掛ける。
+          3. 結果を M（2^(8*byte_length)）で割った余りとして固定長文字列にエンコードする。
+
+        暗号化された値は、
+           E(m) = ( base_val * A * B ) mod M
+        となります。
+        """
+        noise = random.randint(-self.noise_bound, self.noise_bound)
+        base_val = int(m * self.scale) + noise
+        obf = (base_val * self.A * self.B) % self.M
+        return self._encode(obf)
+
+    def decrypt(self, cipher_str):
+        """
+        復号処理：
+          1. 固定長文字列を整数にデコードし、B の効果を除去するために B_inv を掛ける。
+          2. 得られた値を A で除して（四捨五入しながら）元の base_val を近似的に復元し、
+          3. scale で割って平文 m（浮動小数点数）を得る。
+        """
+        obf = self._decode(cipher_str)
+        # B の効果を除去
+        val_with_A = (obf * self.B_inv) % self.M
+        # A で割って base_val を得る（noise の影響は僅かなので四捨五入で調整）
+        base_val = round(val_with_A / self.A)
+        return round(base_val / self.scale, 5)
+
+    def add(self, cipher1, cipher2):
+        """
+        同型加算：
+          E(m1) + E(m2) = (base1*A*B + base2*A*B) mod M = ((base1+base2)*A*B) mod M,
+          復号すると (base1+base2)/scale となるため、平文の加算に対応します。
+        """
+        int1 = self._decode(cipher1)
+        int2 = self._decode(cipher2)
+        res = (int1 + int2) % self.M
+        return self._encode(res)
+
+    def subtract(self, cipher1, cipher2):
+        """
+        同型減算：
+          E(m1) - E(m2) = ((base1 - base2)*A*B) mod M
+        """
+        int1 = self._decode(cipher1)
+        int2 = self._decode(cipher2)
+        res = (int1 - int2) % self.M
+        return self._encode(res)
+
+    def scalar_multiply(self, cipher, constant):
+        """
+        スカラー乗算：
+          暗号文に定数を乗じることで、統計計算（合計、平均など）に利用可能です。
+        """
+        int_val = self._decode(cipher)
+        res = int(round(int_val * constant)) % self.M
+        return self._encode(res)
+
+    def multiply(self, cipher1, cipher2):
+        """
+        同型乗算：
+          各暗号文は E(m) = base * A * B として表されるので、
+          cipher1 * cipher2 = (base1 * A * B) * (base2 * A * B) = base1*base2*A^2*B^2 (mod M)
+
+          ここで、元の乗算結果に対応する暗号文は
+             E(m1*m2) = (base1*base2 * A * B) mod M
+          となるべきなので、余分な A*B の因子を除去するため、
+          乗算後に (A*B*scale) で除算（丸め）して、再度 A*B を掛け直します。
+          （scale による調整は、平文の乗算結果のスケール調整のため）
+        """
+        int1 = self._decode(cipher1)
+        int2 = self._decode(cipher2)
+        product = (int1 * int2) % self.M  # = base1*base2*A^2*B^2 mod M
+        # 補正：余分な A*B を除去してスケール調整
+        corrected = int(round(product / (self.A * self.B * self.scale)))
+        # 再度、難読化（ただしここでは追加雑音は入れず、演算の結果としての暗号文を生成）
+        new_cipher = (corrected * self.A * self.B) % self.M
+        return self._encode(new_cipher)
+
+    def inverse(self, cipher, iterations=5):
+        """
+        同型逆数の近似（ニュートン‐ラフソン法）:
+          反復法を用いて、暗号文上で 1/m を近似計算します。
+          更新式: y_{n+1} = y_n * (2 - c * y_n)
+          ※初期値は encrypt(1.0) としており、平文 m が概ね [1,2] の範囲にある場合の収束を前提とします。
+        """
+        y = self.encrypt(1.0)
+        two_enc = self.encrypt(2.0)
+        for i in range(iterations):
+            cy = self.multiply(cipher, y)
+            diff = self.subtract(two_enc, cy)
+            y = self.multiply(y, diff)
+        return y
+
+    def divide(self, cipher1, cipher2, iterations=5):
+        """
+        同型除算：
+          cipher1 / cipher2 は、cipher2 の逆数を求めた上で乗算することで実現します。
+        """
+        inv_cipher2 = self.inverse(cipher2, iterations)
+        return self.multiply(cipher1, inv_cipher2)
+
+    # 以下は、統計処理の例として、複数の暗号文データから合計・平均・分散を計算する関数の例です。
+    def encrypted_sum(self, cipher_list):
+        """暗号文リストの同型加算"""
+        total = self.encrypt(0.0)
+        for c in cipher_list:
+            total = self.add(total, c)
+        return total
+
+    def encrypted_average(self, cipher_list):
+        """暗号文リストの平均（スカラー乗算を利用）"""
+        total = self.encrypted_sum(cipher_list)
+        n = len(cipher_list)
+        return self.scalar_multiply(total, 1 / n)
+
+    def encrypted_variance(self, cipher_list):
+        """暗号文リストの分散 (E[X^2] - (E[X])^2) を計算"""
+        n = len(cipher_list)
+        sum_sq = self.encrypt(0.0)
+        for c in cipher_list:
+            c_sq = self.multiply(c, c)
+            sum_sq = self.add(sum_sq, c_sq)
+        avg_sq = self.scalar_multiply(sum_sq, 1 / n)
+        avg = self.encrypted_average(cipher_list)
+        avg_of_sq = self.multiply(avg, avg)
+        return self.subtract(avg_sq, avg_of_sq)
 
 
-# ===== デモンストレーション =====
 if __name__ == "__main__":
-    # Aさんが "HELLO" を暗号化して送信
-    plaintext_A = "HELLO"
-    ct_A = encrypt_string_improved(plaintext_A)
-    print("\n[Aさんの暗号化結果]")
-    print("平文:", plaintext_A)
-    print("暗号文:", ct_A)
+    # インスタンス生成（平文は例えば 1.0～2.0 の範囲と想定）
+    fhe = ToyHomomorphicEncryptionEnhanced()
 
-    # Bさんが "HEY" を暗号化して送信
-    plaintext_B = "HEY"
-    ct_B = encrypt_string_improved(plaintext_B)
-    print("\n[Bさんの暗号化結果]")
-    print("平文:", plaintext_B)
-    print("暗号文:", ct_B)
+    # USER1, USER2 などから送信された平文データ（例として10件のランダムな値）
+    num_data = 10
+    plain_data = [round(random.uniform(1.0, 2.0), 5) for _ in range(num_data)]
+    print("【平文データ】")
+    print(plain_data)
 
-    # Cさん：受信した暗号文同士を同型的に連結（足し合わせ）する
-    ct_concat = homomorphic_concat_improved(ct_A, ct_B)
-    print("\n[Cさんによる暗号文連結結果]")
-    print("連結後の暗号文:", ct_concat)
-    # Cさんは内部の秘密（K, A）は知らないため、平文は判読できない
+    # 各平文を暗号化（送信データとして固定長16進数文字列になる）
+    encrypted_data = [fhe.encrypt(x) for x in plain_data]
 
-    # Aさん：連結された暗号文を復号して "HELLOHEY" を得る
-    plaintext_concat = decrypt_string_improved(ct_concat)
-    print("\n[Aさんによる復号結果]")
-    print("復号平文:", plaintext_concat)  # 期待: "HELLOHEY"
+    # USER3 が受け取った暗号文のまま、同型演算による統計処理を実施
+    enc_sum = fhe.encrypted_sum(encrypted_data)
+    enc_avg = fhe.encrypted_average(encrypted_data)
+    enc_var = fhe.encrypted_variance(encrypted_data)
+
+    # 復号して統計結果を確認（復号できるのは秘密情報を持つ認可ユーザーのみ）
+    sum_val = fhe.decrypt(enc_sum)
+    avg_val = fhe.decrypt(enc_avg)
+    var_val = fhe.decrypt(enc_var)
+
+    print("\n【USER3 による暗号文上での統計処理結果】")
+    print("暗号化された合計:", enc_sum)
+    print("暗号化された平均:", enc_avg, "→ 復号結果 =", avg_val)
+    print("暗号化された分散:", enc_var, "→ 復号結果 =", var_val)
